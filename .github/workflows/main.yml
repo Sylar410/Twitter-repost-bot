@@ -1,0 +1,43 @@
+name: scheduled-repost
+
+on:
+  schedule:
+    - cron: "0 0 * * *"
+    - cron: "24 2 * * *"
+    - cron: "48 4 * * *"
+    - cron: "12 7 * * *"
+    - cron: "36 9 * * *"
+    - cron: "0 12 * * *"
+    - cron: "24 14 * * *"
+    - cron: "48 16 * * *"
+    - cron: "12 19 * * *"
+    - cron: "36 21 * * *"
+  workflow_dispatch:
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run repost script
+        env:
+          X_BEARER_TOKEN: ${{ secrets.X_BEARER_TOKEN }}
+          X_CONSUMER_KEY: ${{ secrets.X_CONSUMER_KEY }}
+          X_CONSUMER_SECRET: ${{ secrets.X_CONSUMER_SECRET }}
+          X_ACCESS_TOKEN: ${{ secrets.X_ACCESS_TOKEN }}
+          X_ACCESS_SECRET: ${{ secrets.X_ACCESS_SECRET }}
+          SOURCE_USERNAMES: ${{ secrets.SOURCE_USERNAMES }}
+        run: |
+          python post_repost.py
