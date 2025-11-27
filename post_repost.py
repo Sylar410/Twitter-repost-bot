@@ -30,7 +30,7 @@ ACCESS_TOKEN = os.getenv("X_ACCESS_TOKEN")
 ACCESS_SECRET = os.getenv("X_ACCESS_SECRET")
 
 # Two source usernames (no @). You can override via GitHub Secrets SOURCE_USERNAMES
-RAW_SOURCE_USERS = os.getenv("SOURCE_USERNAMES", "shiyohost,ghostonki")
+RAW_SOURCE_USERS = os.getenv("SOURCE_USERNAMES", "shiryohost,ghostonki")
 SOURCE_USERNAMES = [u.strip() for u in RAW_SOURCE_USERS.split(",") if u.strip()]
 
 MAX_TWEETS_TO_FETCH = int(os.getenv("MAX_TWEETS_TO_FETCH", "5"))
