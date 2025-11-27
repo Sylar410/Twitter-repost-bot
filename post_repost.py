@@ -87,24 +87,48 @@ auth = tweepy.OAuth1UserHandler(
 api_v1 = tweepy.API(auth, wait_on_rate_limit=True)
 
 # Quick-stop safe_api_call: exits immediately on 429 to avoid retries that burn quota
+import sys
 def safe_api_call(func, *args, **kwargs):
     try:
         return func(*args, **kwargs)
-    except tweepy.TooManyRequests as e:
+    except Exception as e:
+        # Try to detect TooManyRequests / 429 and print headers
         resp = getattr(e, "response", None)
-        reset = None
-        if resp is not None:
-            reset = resp.headers.get("x-rate-limit-reset") or resp.headers.get("x_rate_limit_reset")
-        print("[RATE LIMIT] TooManyRequests detected. reset:", reset, flush=True)
-        if reset:
+        status = getattr(resp, "status_code", None) if resp is not None else None
+        print("[API ERROR] exception type:", type(e), "status:", status, flush=True)
+        try:
+            if resp is not None:
+                # Print common rate headers if present
+                for h in ("x-rate-limit-limit","x-rate-limit-remaining","x-rate-limit-reset","x_rate_limit_reset","x-rate-limit-remaining","x-rate-limit-limit"):
+                    val = resp.headers.get(h) if hasattr(resp, "headers") else None
+                    if val:
+                        print(f"[RATE HEADER] {h}: {val}", flush=True)
+                # body
+                try:
+                    print("[HTTP BODY]", resp.text, flush=True)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        # If this looks like rate-limit, exit to avoid further calls
+        if status == 429 or "TooManyRequests" in repr(e) or (resp is not None and resp.status_code == 429):
+            reset = None
             try:
-                print("[RATE LIMIT] resets at (UTC):", time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime(int(reset))), flush=True)
+                reset = resp.headers.get("x-rate-limit-reset") or resp.headers.get("x_rate_limit_reset")
             except Exception:
                 pass
-        print("[RATE LIMIT] Exiting run to avoid further API calls.", flush=True)
-        sys.exit(0)
-    except Exception:
+            if reset:
+                try:
+                    import time
+                    print("[RATE LIMIT] reset epoch:", reset, "=> UTC:", time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime(int(reset))), flush=True)
+                except Exception:
+                    pass
+            print("[RATE LIMIT] Exiting run to avoid further requests.", flush=True)
+            sys.exit(0)
+        # otherwise re-raise for other errors
         raise
+
 
 # Media download helper
 def download_url_to_file(url, dest_path):
