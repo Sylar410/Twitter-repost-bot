@@ -36,6 +36,6 @@ jobs:
           X_ACCESS_TOKEN: ${{ secrets.X_ACCESS_TOKEN }}
           X_ACCESS_SECRET: ${{ secrets.X_ACCESS_SECRET }}
           SOURCE_USERNAMES: ${{ secrets.SOURCE_USERNAMES }}
-          MAX_TWEETS_TO_FETCH: '10'
+          MAX_TWEETS_TO_FETCH: '5'
         run: |
           python post_repost.py
