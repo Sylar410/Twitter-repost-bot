@@ -1,11 +1,17 @@
 # post_repost.py
 """
-Mode B: Multi-source combined pool repost bot with ALTERNATING accounts.
-- Fetches media from one source account per run (alternates across 7 daily slots).
-- Picks a random media tweet from that account, downloads the first image, uploads to your account and posts it.
-- Keeps posted_history.json to avoid reposting the same original tweet locally in the runner.
-- IMPORTANT: Only repost when you have permission or when the media is licensed for reuse.
+Alternating repost bot (Mode B) — full script.
+
+Features:
+- Alternates source account by 7 daily slots (one account per run).
+- Uses since_id per account to only fetch new tweets.
+- Safe API calls with rate-limit handling.
+- Downloads the first photo from a chosen tweet and uploads to your account.
+- Robust upload: simple -> chunked -> convert to JPEG fallback.
+- Keeps posted_history.json to avoid reposting same tweet.
+- Designed for GitHub Actions usage (secrets passed via env).
 """
+
 import os
 import random
 import json
@@ -16,8 +22,9 @@ from dotenv import load_dotenv
 import tweepy
 import time
 from datetime import datetime, timezone
+from requests.exceptions import HTTPError, RequestException
 
-# load .env locally if present
+# Load local .env for local testing (Actions will use GitHub Secrets)
 load_dotenv()
 
 # -----------------------
@@ -29,16 +36,17 @@ CONSUMER_SECRET = os.getenv("X_CONSUMER_SECRET")
 ACCESS_TOKEN = os.getenv("X_ACCESS_TOKEN")
 ACCESS_SECRET = os.getenv("X_ACCESS_SECRET")
 
-# SOURCE_USERNAMES is comma-separated, e.g. "archillect,nasa,earthpix"
-RAW_SOURCE_USERS = os.getenv("SOURCE_USERNAMES", "shiyohost,goodgirlxsz,ghostonki")
+# SOURCE_USERNAMES: can be provided via GitHub Secrets as comma-separated list
+RAW_SOURCE_USERS = os.getenv("SOURCE_USERNAMES", "")
 SOURCE_USERNAMES = [u.strip() for u in RAW_SOURCE_USERS.split(",") if u.strip()]
 
 MAX_TWEETS_TO_FETCH = int(os.getenv("MAX_TWEETS_TO_FETCH", "10"))
 HISTORY_FILE = Path(os.getenv("HISTORY_FILE", "posted_history.json"))
-TWEET_PREFIX = os.getenv("TWEET_PREFIX", "Repost (via @{orig})")  # use {{orig}} in string
+SINCE_FILE = Path(os.getenv("SINCE_FILE", "since_ids.json"))
+TWEET_PREFIX = os.getenv("TWEET_PREFIX", "Repost (via @{orig})")  # use {orig}
 
 # -----------------------
-# Helpers
+# Helpers: history & since_id
 # -----------------------
 def load_history():
     if HISTORY_FILE.exists():
@@ -54,13 +62,19 @@ def save_history(s):
     except Exception:
         pass
 
-def download_url_to_file(url, dest_path):
-    resp = requests.get(url, stream=True, timeout=30)
-    resp.raise_for_status()
-    with open(dest_path, "wb") as f:
-        for chunk in resp.iter_content(1024):
-            if chunk:
-                f.write(chunk)
+def load_since_ids():
+    if SINCE_FILE.exists():
+        try:
+            return json.loads(SINCE_FILE.read_text())
+        except Exception:
+            return {}
+    return {}
+
+def save_since_ids(d):
+    try:
+        SINCE_FILE.write_text(json.dumps(d, indent=2))
+    except Exception:
+        pass
 
 # -----------------------
 # Auth: build clients
@@ -83,9 +97,8 @@ auth = tweepy.OAuth1UserHandler(
 api_v1 = tweepy.API(auth, wait_on_rate_limit=True)
 
 # -----------------------
-# Rate limit safe wrapper
+# Rate-limit safe wrapper
 # -----------------------
-from requests.exceptions import HTTPError, RequestException
 def exponential_backoff(attempt, base=2.0, cap=300):
     wait = base ** attempt
     return min(wait, cap)
@@ -99,8 +112,20 @@ def safe_api_call(func, *args, max_retries=6, **kwargs):
             attempt += 1
             if attempt > max_retries:
                 raise
+            resp = getattr(e, "response", None)
+            reset = None
+            if resp is not None:
+                reset = resp.headers.get("x-rate-limit-reset") or resp.headers.get("x_rate_limit_reset")
+            if reset:
+                try:
+                    wait_for = max(0, int(reset) - int(time.time()))
+                    print(f"[RATE LIMIT] Sleeping until reset (~{wait_for}s).", flush=True)
+                    time.sleep(wait_for + 2)
+                    continue
+                except Exception:
+                    pass
             sleep_for = exponential_backoff(attempt)
-            print(f"Rate limit (TooManyRequests). Backing off {sleep_for}s (attempt {attempt}).", flush=True)
+            print(f"[RATE LIMIT] TooManyRequests: backing off {sleep_for}s (attempt {attempt}).", flush=True)
             time.sleep(sleep_for)
         except HTTPError as e:
             resp = getattr(e, "response", None)
@@ -109,19 +134,18 @@ def safe_api_call(func, *args, max_retries=6, **kwargs):
                 attempt += 1
                 if attempt > max_retries:
                     raise
-                reset = None
                 if resp is not None:
-                    reset = resp.headers.get("x-rate-limit-reset") or resp.headers.get("x-rate_limit_reset")
-                if reset:
-                    try:
-                        wait_for = max(0, int(reset) - int(time.time()))
-                        print(f"429 with reset header; sleeping until reset (~{wait_for}s).", flush=True)
-                        time.sleep(wait_for + 2)
-                        continue
-                    except Exception:
-                        pass
+                    reset = resp.headers.get("x-rate-limit-reset")
+                    if reset:
+                        try:
+                            wait_for = max(0, int(reset) - int(time.time()))
+                            print(f"[HTTP 429] Sleeping until reset (~{wait_for}s).", flush=True)
+                            time.sleep(wait_for + 2)
+                            continue
+                        except Exception:
+                            pass
                 sleep_for = exponential_backoff(attempt)
-                print(f"HTTP 429. Backing off {sleep_for}s (attempt {attempt}).", flush=True)
+                print(f"[HTTP 429] Backing off {sleep_for}s (attempt {attempt}).", flush=True)
                 time.sleep(sleep_for)
             else:
                 raise
@@ -130,35 +154,89 @@ def safe_api_call(func, *args, max_retries=6, **kwargs):
             if attempt > max_retries:
                 raise
             sleep_for = exponential_backoff(attempt)
-            print(f"Network error {e}. Backing off {sleep_for}s (attempt {attempt}).", flush=True)
+            print(f"[NETWORK] RequestException: {e}. Backing off {sleep_for}s.", flush=True)
             time.sleep(sleep_for)
-        except Exception as e:
+        except Exception:
             raise
 
 # -----------------------
-# Find media tweets for a single user
+# Media download helper
 # -----------------------
-def get_recent_media_tweets(username, max_results=10):
+def download_url_to_file(url, dest_path):
+    resp = requests.get(url, stream=True, timeout=30)
+    resp.raise_for_status()
+    with open(dest_path, "wb") as f:
+        for chunk in resp.iter_content(1024):
+            if chunk:
+                f.write(chunk)
+
+# -----------------------
+# Robust upload helper (simple -> chunked -> convert to JPEG)
+# -----------------------
+def upload_media_with_fallback(local_path):
+    # Try simple upload
+    try:
+        uploaded = api_v1.media_upload(filename=str(local_path))
+        return uploaded
+    except Exception as e:
+        print(f"[UPLOAD] Simple upload failed: {e}", flush=True)
+    # Try chunked upload
+    try:
+        uploaded = api_v1.media_upload(filename=str(local_path), chunked=True)
+        return uploaded
+    except Exception as e:
+        print(f"[UPLOAD] Chunked upload failed: {e}", flush=True)
+    # Try convert to JPEG and retry (requires Pillow)
+    try:
+        from PIL import Image
+        img = Image.open(local_path)
+        jpg_path = str(Path(local_path).with_suffix(".jpg"))
+        rgb = img.convert("RGB")
+        rgb.save(jpg_path, format="JPEG", quality=88)
+        print(f"[UPLOAD] Converted to JPEG: {jpg_path}", flush=True)
+        uploaded = api_v1.media_upload(filename=jpg_path)
+        return uploaded
+    except Exception as e:
+        print(f"[UPLOAD] JPEG conversion+upload failed: {e}", flush=True)
+        # attempt to surface HTTP body if present
+        try:
+            if hasattr(e, "response") and e.response is not None:
+                print("HTTP status:", e.response.status_code, flush=True)
+                print("HTTP body:", e.response.text, flush=True)
+        except Exception:
+            pass
+        raise
+
+# -----------------------
+# Get recent media tweets (supports since_id)
+# -----------------------
+def get_recent_media_tweets(username, max_results=10, since_id=None):
     try:
         user = safe_api_call(client_v2.get_user, username=username)
     except Exception as e:
-        print(f"[{username}] get_user error: {e}", flush=True)
+        print(f"[{username}] get_user ERROR → {e}", flush=True)
         return []
 
     if not user or not getattr(user, "data", None):
-        print(f"[{username}] user not found or no data.", flush=True)
+        print(f"[{username}] no user data returned.", flush=True)
         return []
+
     uid = user.data.id
 
+    params = dict(
+        id=uid,
+        max_results=min(max_results, 100),
+        expansions=["attachments.media_keys", "author_id"],
+        media_fields=["url", "type", "alt_text"],
+        tweet_fields=["created_at", "attachments"]
+    )
+    if since_id:
+        params["since_id"] = since_id
+
     try:
-        resp = safe_api_call(client_v2.get_users_tweets,
-                             id=uid,
-                             max_results=min(max_results, 100),
-                             expansions=["attachments.media_keys", "author_id"],
-                             media_fields=["url","type","alt_text"],
-                             tweet_fields=["created_at","attachments","entities"])
+        resp = safe_api_call(client_v2.get_users_tweets, **params)
     except Exception as e:
-        print(f"[{username}] get_users_tweets error: {e}", flush=True)
+        print(f"[{username}] get_users_tweets ERROR → {e}", flush=True)
         return []
 
     if not resp or not getattr(resp, "data", None):
@@ -169,19 +247,29 @@ def get_recent_media_tweets(username, max_results=10):
         for m in resp.includes["media"]:
             media_map[m.media_key] = m
 
-    tweets_with_media = []
+    out = []
     for t in resp.data:
         try:
             keys = t.attachments.get("media_keys", []) if getattr(t, "attachments", None) else []
         except Exception:
             keys = []
-        valid_keys = [k for k in keys if k in media_map and getattr(media_map[k], "url", None) and getattr(media_map[k], "type", None)=="photo"]
-        if valid_keys:
-            tweets_with_media.append((t, [media_map[k] for k in valid_keys]))
-    return tweets_with_media
+        valid = []
+        for k in keys:
+            mm = media_map.get(k)
+            if not mm:
+                continue
+            if getattr(mm, "type", None) != "photo":
+                continue
+            if not getattr(mm, "url", None):
+                continue
+            valid.append(mm)
+        if valid:
+            out.append((t, valid))
+
+    return out
 
 # -----------------------
-# Rotation logic: map current time to one of 7 daily slots (0..6)
+# Rotation: map current time to one of 7 slots
 # -----------------------
 def current_slot_index_7():
     now = datetime.now(timezone.utc)
@@ -191,29 +279,49 @@ def current_slot_index_7():
     return slot  # 0..6
 
 # -----------------------
-# Main flow: pick account based on slot, then repost from that account
+# Main flow
 # -----------------------
 def pick_and_repost_from_slot():
     if not SOURCE_USERNAMES:
         print("No SOURCE_USERNAMES configured. Set SOURCE_USERNAMES as a comma-separated list in env/secrets.", flush=True)
         return
 
+    since_ids = load_since_ids()
     history = load_history()
-    print("Loaded history entries:", len(history), flush=True)
+    print("Loaded history size:", len(history), "since_ids:", since_ids, flush=True)
 
     slot = current_slot_index_7()
     account_index = slot % len(SOURCE_USERNAMES)
     source_user = SOURCE_USERNAMES[account_index]
     print(f"Current slot: {slot} -> using account: {source_user}", flush=True)
 
-    tweets = get_recent_media_tweets(source_user, MAX_TWEETS_TO_FETCH)
+    last_seen = since_ids.get(source_user)
+    tweets = get_recent_media_tweets(source_user, max_results=MAX_TWEETS_TO_FETCH, since_id=last_seen)
     if not tweets:
-        print(f"No candidate media tweets found for {source_user}", flush=True)
+        print(f"No new media tweets for {source_user}", flush=True)
+        # update since_id to newest available if any (prevents refetching same items)
+        try:
+            # attempt a fresh fetch without since_id to update pointer if there are tweets
+            resp_all = get_recent_media_tweets(source_user, max_results=MAX_TWEETS_TO_FETCH, since_id=None)
+            if resp_all:
+                highest = max(int(t.id) for (t, _) in resp_all)
+                since_ids[source_user] = str(highest)
+                save_since_ids(since_ids)
+        except Exception:
+            pass
         return
 
+    # Filter out already reposted tweets
     candidates = [(t, media_list) for (t, media_list) in tweets if str(t.id) not in history]
     if not candidates:
-        print("No new media tweets to repost (all already in history).", flush=True)
+        print("No new candidates (all in history).", flush=True)
+        # update since_id to highest so we don't fetch them again
+        try:
+            highest = max(int(t.id) for (t, _) in tweets)
+            since_ids[source_user] = str(highest)
+            save_since_ids(since_ids)
+        except Exception:
+            pass
         return
 
     chosen_tweet, media_list = random.choice(candidates)
@@ -230,43 +338,55 @@ def pick_and_repost_from_slot():
     with tempfile.TemporaryDirectory() as tmpdir:
         local_path = Path(tmpdir) / "image"
         ext = os.path.splitext(media_url.split("?")[0])[1]
-        if ext:
-            local_path = local_path.with_suffix(ext)
-        else:
-            local_path = local_path.with_suffix(".jpg")
+        local_path = local_path.with_suffix(ext if ext else ".jpg")
         try:
             download_url_to_file(media_url, local_path)
         except Exception as e:
             print("Failed to download media:", e, flush=True)
             return
 
-        print("Downloaded to:", local_path, " — uploading to your account...", flush=True)
+        print("Downloaded to:", local_path, " — uploading...", flush=True)
         try:
-            uploaded = safe_api_call(api_v1.media_upload, filename=str(local_path))
+            uploaded = safe_api_call(upload_media_with_fallback, local_path)
             media_id = uploaded.media_id_string if hasattr(uploaded, "media_id_string") else str(uploaded.media_id)
             print("Uploaded media_id:", media_id, flush=True)
         except Exception as e:
-            print("Media upload failed:", e, flush=True)
+            print("Media upload ultimately failed:", e, flush=True)
             return
 
-        new_text = f"{TWEET_PREFIX.format(orig=source_user)}\\nOriginal: https://twitter.com/{source_user}/status/{tid}\\n(Used with permission)"
-        print("Posting new tweet with text:\\n", new_text[:300], flush=True)
+        new_text = f"{TWEET_PREFIX.format(orig=source_user)}\nOriginal: https://twitter.com/{source_user}/status/{tid}\n(Used with permission)"
+        print("Posting new tweet with text preview:", new_text[:200], flush=True)
         try:
             resp = safe_api_call(client_v2.create_tweet, text=new_text, media_ids=[media_id])
             print("Posted new tweet. response:", resp, flush=True)
             history.add(tid)
             save_history(history)
-            print("Saved history; done.", flush=True)
+            # update since_id to highest of fetched tweets
+            try:
+                highest = max(int(t.id) for (t, _) in tweets)
+                since_ids[source_user] = str(highest)
+                save_since_ids(since_ids)
+            except Exception:
+                pass
+            print("Done.", flush=True)
         except Exception as e:
             print("Failed to create tweet (v2):", e, flush=True)
+            # fallback to v1.1
             try:
                 safe_api_call(api_v1.update_status, status=new_text, media_ids=[media_id])
                 print("Posted via v1.1 fallback.", flush=True)
                 history.add(tid)
                 save_history(history)
+                try:
+                    highest = max(int(t.id) for (t, _) in tweets)
+                    since_ids[source_user] = str(highest)
+                    save_since_ids(since_ids)
+                except Exception:
+                    pass
             except Exception as e2:
                 print("Fallback post failed:", e2, flush=True)
 
 if __name__ == "__main__":
+    # small random delay to desynchronize runs
     time.sleep(random.random() * 8)
     pick_and_repost_from_slot()
